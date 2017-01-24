@@ -1,0 +1,314 @@
+/* 
+ * File:   MBSet.cu
+ * 
+ * Created on June 24, 2012
+ * 
+ * Purpose:  This program displays Mandelbrot set using the GPU via CUDA and
+ * OpenGL immediate mode.
+ * 
+ */
+
+#include <iostream>
+#include <stack>
+#include <cuda_runtime_api.h>
+#include <stdio.h>
+#include <math.h>
+#include <time.h>
+#include <vector>
+#include "Complex.cu"
+
+#include <GL/freeglut.h>
+#include <GL/gl.h>
+#include <GL/glu.h>
+#include <GL/glut.h>
+
+
+// Size of window in pixels, both width and height
+#define WINDOW_DIM            512
+//threads per block
+#define THREADS_PB	      32
+#define N		      (WINDOW_DIM*WINDOW_DIM)
+
+using namespace std;
+
+//==================GLOBALS========================
+
+// Initial screen coordinates, both host and device.
+Complex minC(-2.0, -1.2);
+Complex maxC(1.0, 1.8);
+Complex* dev_minC;
+Complex* dev_maxC;
+const int maxIt = 2000; // Msximum Iterations
+
+float xmin = -2.0, xmax = 1.0;
+float ymin = -1.2, ymax = 1.8;
+
+Complex* c = new Complex[WINDOW_DIM * WINDOW_DIM];
+Complex* dev_c;       
+
+int w = WINDOW_DIM;
+int h = WINDOW_DIM;
+
+int iter_count [WINDOW_DIM * WINDOW_DIM];
+int dev_icount;
+
+float dx, dy, dz;
+
+bool drawing = false;
+
+
+//===============CLASSES/STUCTS==================
+
+class RGB
+{
+  public: RGB(): r(0), g(0), b(0){ }
+  RGB( float r0, float g0, double b0): r(r0),g(g0),b(b0){}
+  public: 
+  	float r;
+	float g;
+	float b;
+}
+
+struct Point
+{
+  int x,y;
+}
+
+class Frame
+{
+  public: 
+  float minC_x;
+  float minC_y;
+  float maxC_x;
+  float maxC_y;
+  Frame(float a, float b, float c, float d) : minC_x(a), minC_y(b), maxC_x(c), maxC_y(d);
+}
+
+//============CLASS VARIABLES===================
+
+vector <Frame> frame_vec;
+RGB* colors = 0; // Array of color values
+Pint start, end;
+
+//============ MB FUNCTIONS ========================
+
+__global__ void calcMB (Complex* dev_minC, Complex* dev_maxC, int* dev_icount, Complex* dev_c)
+{
+  int index = threadIdx.x + blockIdx.x * blockDim.x;
+  int i = id / WINDOW_DIM;
+  int j = id % WINDOW_DIM; 
+  double dr = dev_maxC->r - dev_minC->r;
+  double di = dev_maxC->i - dev_minC->i;
+  double nr = (double) i / WINDOW_DIM;
+  double ni = (double) j / WINDOW_DIM;
+	
+  dev_c[id].r = dev_minC->r + nr * dr;
+  dev_c[id].i = dev_minC->i + ni * di;
+
+  Complex Z (0,0);
+  Z.r = dev_c[id].r;
+  Z.i = dev_c[id].i;
+  dev_computation[id] = 0;
+  while(dev_icount[id] < maxIt && Z.magnitude2() < 4.0)
+  {
+	dev_computation[id]++;
+	Z = (Z*Z) + dev_c[id];
+  }	
+}
+
+void cuda()
+{
+  //make space on the device
+  cudaMalloc((void**)&dev_icount, N *sizeof(int));
+  cudaMalloc((void**)&dev_c, N * sizeof(Complex));
+  cudaMalloc((void**)&dev_minC, sizeof(Complex));
+  cudaMalloc((void**)&dev_maxC, sizeof(Complex));
+  //copy from host to device
+  cudaMemcpy(dev_minC, &minC, sizeof(Complex), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_maxC, &maxC, sizeof(Complex), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_icount, iter_count, N*sizeof(int), cudaMemcpyHostToDevice);  
+  cudaMemcpy(dev_c, c, N*sizeof(Complex), cudaMemcpyHostToDevice);  
+  //do the calculation
+  calcMB<<< N / THREADS_PB, THREADS_PB >>>(dev_minC, dev_maxC, dev_computation, dev_c);
+  //copy from device to host
+  cudaMemcpy(iter_count, dev_icount, N*sizeof(int), cudaMemcpyDeviceToHost);
+  cudaMemcpy(c, dev_c, N*sizeof(Complex), cudaMemcpyDeviceToHost);
+}
+
+//================ OGL FUNCTIONS ==================
+
+void init()
+{
+  //draw();
+  
+  glViewport(0,0,WINDOW_DIM, WINDOW_DIM);
+  glMaxtrixMode(GL_PROJECTION);
+  glLoadIdentity();
+
+  glOrtho2D(0,WINDOW_DIM, WINDOW_DIM, 0);
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+}
+
+void display()
+{
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glOrtho(0, WINDOW_DIM, WINDOW_DIM, 0,0,1);
+  glDisable(GL_DEPTH_TEST);
+  glMatrixMode(GL_MODELVIEW);
+  glClearColor(0.0, 0.0, 0.0, 0);
+  glClear(GL_COLOR_BUFFER_BIT);
+  
+  Pixels();
+  
+  if(drawing)
+    Square();
+  glutSwapBuffers();
+}
+
+void Square()
+{
+  glColor3f(1, 1, 1);
+  glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+  glBegin(GL_POLYGON);
+  glVertex2f(start.x, start.y);
+  glVertex2f(end.x, start.y);
+  glVertex2f(end.x, end.y);
+  glVertex2f(start.x, end.y);
+  glEnd(); 
+}
+
+void Pixels()                                                                  // Function to display MB Set
+{
+  glBegin(GL_POINTS);
+  for(int i = 0; i < WINDOW_DIM; i++)
+  {
+    for(int j = 0; j < WINDOW_DIM; j++)
+    {
+      glColor3f(colors[iter_count[i*WINDOW_DIM + j]].r, colors[iter_count[i*WINDOW_DIM + j]].g, colors[iter_count[i*WINDOW_DIM + j]].b);
+      glVertex2d(i, j);
+    }
+  }
+  glEnd();
+}
+  
+void mouse(int button, int state, int x, int y)
+{
+  	if(button == GLUT_LEFT_BUTTON){
+			if(state==GLUT_DOWN) {
+				start.x = x; end.x = x;
+				start.y = y; end.y = y;
+				drawing = true;		
+			}
+			
+			if(state==GLUT_UP) {
+				frame_vec.push_back(Frame(minC.r, minC.i, maxC.r, maxC.i));
+
+				
+				// FIX THIS UPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP
+				if (xmin > xmax) { 
+					xmax = xmin + xmax; 
+					xmin = xmax - xmin; 
+					xmax = xmax - xmin;
+					xflag = true; 
+				}
+				if (ymin > ymax) { 
+					ymax = ymin + ymax; 
+					ymin = ymax - ymin; 
+					ymax = ymax - ymin;
+					yflag = true; 
+				}
+				if (abs(maxys - minys) > abs(maxxs - minxs)) { 
+						yflag ? minys = maxys - (maxxs - minxs) : maxys = minys + (maxxs - minxs); 
+						yflag ? ymin  = ymax  - (xmax  -  xmin) : ymax  = ymin  + (xmax  -  xmin);
+					    yflag = false;
+				}
+				if (abs(maxxs - minxs) > abs(maxys - minys)) { 
+						xflag ? minxs = maxxs - (maxys - minys) : maxxs = minxs + (maxys - minys); 
+						xflag ? xmin  = xmax  - (ymax  -  ymin) : xmax  = xmin  + (ymax  -  ymin);
+						xflag = false;				
+				}
+				xminv.push_back(xmin);
+				xmaxv.push_back(xmax);
+				yminv.push_back(ymin);
+				ymaxv.push_back(ymax);
+				cuda();
+				drawing = false;
+				glutPostRedisplay();
+			}
+}
+
+void keyboard(unsigned char key, int x, int y)
+{
+  if (key == 'b')
+  {
+    //load previous frame
+    if(frame_vec.size() > 0 )
+    {
+      class temp = frame_vec.back();
+      frame_vec.pop_back();
+    }
+  }
+}
+
+void InitializeColors()
+{
+  type_t t = time(0);
+  srand48(t);
+  colors = new RGB[maxIt + 1];
+  for (int i = 0; i < maxIt; ++i)
+    {
+      if (i < 5)
+        { // Try this.. just white for small it counts
+          colors[i] = RGB(1, 1, 1);
+        }
+      else
+        {
+          colors[i] = RGB(drand48(), drand48(), drand48());
+        }
+    }
+  colors[maxIt] = RGB(); // black
+}
+
+void reshape(int w, int h)
+{
+  glViewport(0.0, 0.0, (GLsizei) WINDOW_DIM, (GLsizei) WINDOW_DIM);
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glOrtho((GLdouble) 0.0, (GLdouble) w, (GLdouble)0.0, (GLdouble)h, (GLdouble) -w, (GLdouble) w);
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity(); 
+}
+
+int main(int argc, char** argv)
+{
+  // Initialize OPENGL here
+  // Set up necessary host and device buffers
+  // set up the opengl callbacks for display, mouse and keyboard
+
+  // Calculate the interation counts
+  // Grad students, pick the colors for the 0 .. 1999 iteration count pixels
+
+  InitializeColors();
+  glutInit(&argc, argv);
+  //Window
+  glutInitDisplayMode( GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
+  glutInitWindowSize(WINDOW_DIM, WINDOW_DIM);
+  glutInitWindowPosition(100,100);
+  glutCreateWindow("MBSet");
+  
+  init();
+
+  //Callbacks
+  glutDisplayFunc(display);
+  glutIdleFunc(display);
+  glutMouseFunc(mouse);
+  glutKeyboardFunc(keyboard);
+  glutMotionFunc(motion);
+  glutReshapeFunc(reshape);
+
+  glutMainLoop(); // This will callback the display, keyboard and mouse
+  return 0;
+  
+}
